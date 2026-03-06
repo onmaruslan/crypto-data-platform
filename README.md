@@ -120,16 +120,5 @@ docker compose up -d
 
 ## Screenshots
 
-Add screenshots in `docs/` and reference them here.
-
-Example:
-
 ![Dashboard](docs/dashboard.png)
 ![Airflow](docs/airflow.png)
-
----
-
-## Notes
-
-- The data table uses `(ts, symbol)` as a primary key and applies UPSERT to keep runs idempotent.
-- Timestamps are rounded to the minute to avoid microsecond-level duplicates.
