@@ -3,37 +3,67 @@ from airflow.operators.python import PythonOperator
 from datetime import datetime
 import sys
 
+# Allow imports from /opt/airflow/src
 sys.path.append("/opt/airflow/src")
 
-from extract import fetch_crypto_data
-from load import save_raw_to_s3
-from transform import transform_raw_to_prices_df
-from load_processed import save_processed_to_s3
-from load_postgres import upsert_prices_to_postgres
+# ingestion
+from ingestion.extract_api import fetch_crypto_data
+
+# storage layers
+from storage.s3_raw import save_raw_to_s3, read_raw_from_s3
+from storage.s3_staging import save_parquet_to_s3, read_parquet_from_s3
+from storage.postgres_loader import upsert_prices
+
+# processing
+from processing.transform import transform_raw_to_prices_df
 
 
 def extract_task(ti):
+    """
+    1. Fetch data from API
+    2. Save to RAW S3
+    3. Pass only S3 key via XCom
+    """
+
     raw = fetch_crypto_data()
-    save_raw_to_s3(raw)
-    ti.xcom_push(key="raw", value=raw)
+
+    raw_key = save_raw_to_s3(raw)
+
+    ti.xcom_push(key="raw_key", value=raw_key)
 
 
 def transform_task(ti):
-    raw = ti.xcom_pull(key="raw", task_ids="extract_raw")
+    """
+    1. Read RAW from S3
+    2. Transform → DataFrame
+    3. Save to STAGING (Parquet)
+    4. Pass staging key via XCom
+    """
+
+    raw_key = ti.xcom_pull(key="raw_key", task_ids="extract_raw")
+
+    raw = read_raw_from_s3(raw_key)
+
     df = transform_raw_to_prices_df(raw)
 
-    # Use the raw timestamp as a run identifier for the parquet filename
     run_ts = str(raw["timestamp"])
-    save_processed_to_s3(df, run_ts)
 
-    # Store a small payload in XCom (DataFrame is not stored in XCom)
-    ti.xcom_push(key="run_ts", value=run_ts)
+    staging_key = save_parquet_to_s3(df, run_ts)
+
+    ti.xcom_push(key="staging_key", value=staging_key)
 
 
-def load_to_postgres_task(ti):
-    raw = ti.xcom_pull(key="raw", task_ids="extract_raw")
-    df = transform_raw_to_prices_df(raw)
-    upsert_prices_to_postgres(df)
+def load_task(ti):
+    """
+    1. Read Parquet from STAGING
+    2. Load into Postgres (idempotent upsert)
+    """
+
+    staging_key = ti.xcom_pull(key="staging_key", task_ids="transform")
+
+    df = read_parquet_from_s3(staging_key)
+
+    upsert_prices(df)
 
 
 with DAG(
@@ -48,14 +78,14 @@ with DAG(
         python_callable=extract_task,
     )
 
-    transform_and_save = PythonOperator(
-        task_id="transform_and_save_parquet",
+    transform = PythonOperator(
+        task_id="transform",
         python_callable=transform_task,
     )
 
-    load_to_postgres = PythonOperator(
-        task_id="load_to_postgres",
-        python_callable=load_to_postgres_task,
+    load = PythonOperator(
+        task_id="load",
+        python_callable=load_task,
     )
 
-    extract_raw >> transform_and_save >> load_to_postgres
+    extract_raw >> transform >> load
